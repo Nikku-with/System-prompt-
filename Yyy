@@ -1,0 +1,294 @@
+Here's a comprehensive system prompt + architecture blueprint for building a highly advanced, unpredictable autonomous agent engine:Click any node above for a deep dive. Here's the full prompt + architecture:
+
+---
+
+## 🧠 Master System Prompt
+
+```
+You are ARIA — Autonomous Reasoning & Inference Agent.
+
+## CORE IDENTITY
+You are a self-directed agent capable of multi-step reasoning, tool use,
+sub-task delegation, self-critique, and course correction. You do NOT ask
+for permission before acting on clearly scoped goals. You act, observe,
+reflect, and adapt in tight loops until the goal is satisfied or a hard
+stop is triggered.
+
+## UNPREDICTABILITY ENGINE
+You must NOT follow a fixed reasoning template. Each new task should be
+approached via whichever combination of strategies best fits:
+  - Decompose → Plan → Execute (classic BFS/DFS task trees)
+  - Hypothesis → Test → Revise (scientific loop)
+  - Observe → Orient → Decide → Act (OODA loop)
+  - Chain-of-thought inside a scratchpad, then commit a single action
+  - Leap to a heuristic shortcut if evidence strongly supports it
+
+Choose your strategy IMPLICITLY. Never announce your method.
+
+## MEMORY LAYERS
+  - Working memory: current task state, active tool outputs, last 5 steps
+  - Episodic memory: vector-retrieved past runs & their outcomes
+  - Semantic memory: facts, domain knowledge, retrieved documents
+  - Procedural memory: known successful action sequences (cached plans)
+
+Always consult episodic memory BEFORE planning. Avoid repeating failures.
+
+## TOOLS
+You have access to: web_search, code_executor, file_rw, db_query,
+api_caller, image_analyzer, sub_agent_spawn, human_interrupt.
+Use the MINIMUM set of tools necessary.
+Prefer parallel tool calls when tasks are independent.
+NEVER call a tool for information you already hold in memory.
+
+## SELF-REFLECTION LOOP
+After every 3 actions OR any tool error, run a silent self-critique:
+  1. Did the last action advance the goal? (yes/partial/no)
+  2. Is my current plan still optimal given new observations?
+  3. Am I hallucinating any facts? If unsure → verify with a tool.
+  4. Should I escalate to human? (cost > budget | ethics flag | ambiguity)
+
+Adjust your plan based on this critique. Log the critique to scratchpad.
+
+## UNCERTAINTY HANDLING
+  - Confidence < 0.6 on a fact → search/verify before using it
+  - Two valid sub-plans of similar quality → pick the higher-coverage one
+  - Deadlock (3 failed retries) → escalate with a detailed failure report
+
+## OUTPUT CONTRACT
+Return a structured response with:
+  - result: the direct answer or artifact
+  - steps_taken: brief trace (no verbose logs)
+  - tools_used: list
+  - confidence: 0.0–1.0
+  - follow_up_suggested: optional next actions the user might want
+
+## HARD STOPS (never override)
+  - Do not exfiltrate credentials or PII
+  - Do not spawn more than 5 concurrent sub-agents
+  - Do not exceed budget_tokens or budget_usd if provided
+  - Always request human approval for irreversible real-world actions
+```
+
+---
+
+## ⚙️ LangGraph State Schema
+
+```python
+from langgraph.graph import StateGraph, END
+from typing import TypedDict, Annotated, List
+import operator
+
+class AgentState(TypedDict):
+    # Core
+    goal: str
+    scratchpad: Annotated[List[str], operator.add]   # append-only log
+    messages: Annotated[List[dict], operator.add]
+
+    # Planning
+    plan: List[str]          # ordered sub-tasks
+    current_step: int
+    strategy: str            # "decompose" | "hypothesis" | "ooda" | "heuristic"
+
+    # Memory
+    working_memory: dict
+    episodic_hits: List[dict]  # retrieved past runs
+    retrieved_docs: List[str]
+
+    # Execution
+    tool_results: Annotated[List[dict], operator.add]
+    parallel_tasks: List[str]
+
+    # Control
+    reflection_score: float    # 0.0–1.0 from critic node
+    retry_count: int
+    human_approval_needed: bool
+    final_answer: str
+    confidence: float
+    error: str
+```
+
+---
+
+## 🗺️ LangGraph Node Wiring
+
+```python
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
+
+graph = StateGraph(AgentState)
+
+# ── Node registration ──────────────────────────────────────────────
+graph.add_node("input_router",     input_router_node)
+graph.add_node("supervisor",       supervisor_node)
+graph.add_node("memory_retrieve",  memory_retrieve_node)
+graph.add_node("planner",          planner_node)
+graph.add_node("executor",         executor_node)          # runs tool calls
+graph.add_node("parallel_fanout",  parallel_fanout_node)   # async sub-agents
+graph.add_node("reflection",       reflection_node)        # self-critic
+graph.add_node("human_gate",       human_gate_node)        # interrupt
+graph.add_node("output_synth",     output_synth_node)
+
+# ── Entry ──────────────────────────────────────────────────────────
+graph.set_entry_point("input_router")
+
+# ── Edges ──────────────────────────────────────────────────────────
+graph.add_edge("input_router",    "supervisor")
+graph.add_edge("supervisor",      "memory_retrieve")
+graph.add_edge("memory_retrieve", "planner")
+
+# Conditional: needs human approval?
+graph.add_conditional_edges("planner", route_human_or_exec, {
+    "human":    "human_gate",
+    "execute":  "executor",
+    "parallel": "parallel_fanout",
+})
+
+graph.add_edge("human_gate",      "executor")
+graph.add_edge("parallel_fanout", "executor")
+
+# Conditional: reflection loop or done?
+graph.add_conditional_edges("executor", route_reflection, {
+    "reflect":  "reflection",
+    "done":     "output_synth",
+})
+
+graph.add_conditional_edges("reflection", route_after_reflection, {
+    "retry":      "planner",    # re-plan with new info
+    "escalate":   "human_gate",
+    "done":       "output_synth",
+})
+
+graph.add_edge("output_synth", END)
+
+# ── Compile with checkpointing ─────────────────────────────────────
+checkpointer = MemorySaver()
+app = graph.compile(
+    checkpointer=checkpointer,
+    interrupt_before=["human_gate"],   # pause for human approval
+)
+```
+
+---
+
+## 🔀 Strategy Router (Unpredictability Engine)
+
+```python
+import random
+from langchain_core.prompts import ChatPromptTemplate
+
+STRATEGIES = ["decompose", "hypothesis", "ooda", "heuristic", "socratic"]
+
+def supervisor_node(state: AgentState) -> AgentState:
+    """Pick a reasoning strategy dynamically based on goal type."""
+    goal = state["goal"]
+
+    strategy_prompt = ChatPromptTemplate.from_messages([
+        ("system", """Classify this goal into ONE reasoning strategy:
+          - decompose   : complex multi-step task, clear sub-goals
+          - hypothesis  : uncertain outcome, needs testing/probing
+          - ooda        : fast-changing environment, real-time data
+          - heuristic   : pattern matches a known solved class
+          - socratic    : ambiguous goal, needs clarifying questions first
+         Return ONLY the strategy name. No explanation."""),
+        ("human", "{goal}")
+    ])
+
+    chain = strategy_prompt | llm
+    strategy = chain.invoke({"goal": goal}).content.strip().lower()
+
+    if strategy not in STRATEGIES:
+        strategy = random.choice(STRATEGIES)  # true unpredictability fallback
+
+    return {**state, "strategy": strategy,
+            "scratchpad": [f"[supervisor] strategy={strategy}"]}
+```
+
+---
+
+## 🪞 Reflection / Critic Node
+
+```python
+def reflection_node(state: AgentState) -> AgentState:
+    recent_tools = state["tool_results"][-3:]
+    
+    critic_prompt = f"""
+    Goal: {state['goal']}
+    Last 3 actions: {recent_tools}
+    Current plan step: {state['current_step']} / {len(state['plan'])}
+
+    Rate progress 0.0–1.0 and identify:
+    1. Any factual hallucinations?
+    2. Is the plan still optimal?
+    3. Should a human approve the next step? (yes/no)
+
+    Return JSON: {{"score": float, "issues": [], "needs_human": bool, "revised_plan": []}}
+    """
+    
+    response = llm.invoke(critic_prompt)
+    critique = parse_json(response.content)
+
+    return {
+        **state,
+        "reflection_score":       critique["score"],
+        "human_approval_needed":  critique["needs_human"],
+        "plan": critique.get("revised_plan") or state["plan"],
+        "scratchpad": [f"[reflection] score={critique['score']} issues={critique['issues']}"],
+        "retry_count": state["retry_count"] + (1 if critique["score"] < 0.5 else 0),
+    }
+```
+
+---
+
+## 🚀 Run the Engine
+
+```python
+from langchain_anthropic import ChatAnthropic
+
+llm = ChatAnthropic(model="claude-opus-4-6", temperature=0.7)
+
+config = {
+    "configurable": {"thread_id": "agent-run-001"},
+    "recursion_limit": 50,          # max graph cycles
+}
+
+initial_state = AgentState(
+    goal="Research the top 5 open-source LLM frameworks in 2025, "
+         "benchmark their GitHub stars trend, and write a markdown report.",
+    scratchpad=[],
+    messages=[],
+    plan=[],
+    current_step=0,
+    strategy="",
+    working_memory={},
+    episodic_hits=[],
+    retrieved_docs=[],
+    tool_results=[],
+    parallel_tasks=[],
+    reflection_score=1.0,
+    retry_count=0,
+    human_approval_needed=False,
+    final_answer="",
+    confidence=0.0,
+    error="",
+)
+
+for event in app.stream(initial_state, config=config):
+    for node_name, output in event.items():
+        print(f"[{node_name}] → {list(output.keys())}")
+```
+
+---
+
+## 🧩 What Makes It "Unpredictable"
+
+| Mechanism | How it creates variability |
+|---|---|
+| **Strategy router** | 5 different reasoning loops chosen per goal type |
+| **Temperature 0.7** | Non-deterministic LLM outputs on each run |
+| **Reflection revision** | Critic rewrites the plan mid-execution |
+| **Parallel fanout** | Sub-agents explore branches simultaneously |
+| **Episodic memory** | Past failures alter current strategy choices |
+| **OODA loop** | Real-time tool results change next actions dynamically |
+| **Human interrupts** | Introduces external signals mid-graph |
+
+This gives you a production-grade, self-adapting agent that reasons differently every run while staying bounded by hard safety stops.
